@@ -1,94 +1,71 @@
 # Copyright 2025 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-# Learn more about testing at: https://ops.readthedocs.io/en/latest/explanation/testing.html
-
-"""Unit tests."""
-
-import typing
-
+import unittest
+from unittest.mock import Mock, patch
 import ops
-import ops.testing
+from ops.testing import Harness
+from charm import GatewayRouteConfiguratorCharm
 
-from charm import Charm
+class TestCharm(unittest.TestCase):
+    def setUp(self):
+        self.harness = Harness(GatewayRouteConfiguratorCharm)
+        self.addCleanup(self.harness.cleanup)
+        self.harness.begin()
 
+    def test_config_changed_missing_hostname(self):
+        self.harness.update_config({"hostname": ""})
+        self.assertIsInstance(self.harness.charm.unit.status, ops.BlockedStatus)
+        self.assertEqual(self.harness.charm.unit.status.message, "Missing 'hostname' config")
 
-def test_reconcile_on_pebble_ready():
-    """
-    arrange: State with the container httpbin.
-    act: Run httpbin_pebble_ready hook.
-    assert: The unit is active and the httpbin container service is active.
-    """
-    context = ops.testing.Context(
-        charm_type=Charm,
-    )
-    container = ops.testing.Container(name="httpbin", can_connect=True)  # type: ignore[call-arg]
-    base_state: dict[str, typing.Any] = {
-        "config": {"log-level": "info"},
-        "containers": {container},
-    }
-    state_in = ops.testing.State(**base_state)
-    state_out = context.run(context.on.pebble_ready(container), state_in)
-    assert state_out.unit_status == ops.testing.ActiveStatus()
-    # Check the service was started:
-    assert (
-        state_out.get_container(container.name).service_statuses["httpbin"]
-        == ops.pebble.ServiceStatus.ACTIVE
-    )
+    def test_config_changed_invalid_hostname(self):
+        self.harness.update_config({"hostname": "Invalid_Hostname"})
+        self.assertIsInstance(self.harness.charm.unit.status, ops.BlockedStatus)
+        self.assertTrue("Invalid hostname" in self.harness.charm.unit.status.message)
 
+    def test_missing_ingress_relation(self):
+        self.harness.update_config({"hostname": "valid.example.com"})
+        self.assertIsInstance(self.harness.charm.unit.status, ops.BlockedStatus)
+        self.assertEqual(self.harness.charm.unit.status.message, "Missing 'ingress' relation")
 
-def test_reconcile_on_config_changed_valid():
-    """
-    arrange: State with the container httpbin and valid config change.
-    act: Run config_changed hook (which calls reconcile).
-    assert: The unit is active and configuration is applied.
-    """
-    context = ops.testing.Context(
-        charm_type=Charm,
-    )
-    container = ops.testing.Container(name="httpbin", can_connect=True)  # type: ignore[call-arg]
-    base_state: dict[str, typing.Any] = {
-        "config": {"log-level": "debug"},
-        "containers": {container},
-    }
-    state_in = ops.testing.State(**base_state)
-    state_out = context.run(context.on.config_changed(), state_in)
-    assert state_out.unit_status == ops.testing.ActiveStatus()
+    @patch("charms.traefik_k8s.v2.ingress.IngressPerAppProvider.get_data")
+    def test_happy_path(self, mock_get_data):
+        # Mock ingress data
+        class MockAppData:
+            def __init__(self):
+                self.name = "my-app"
+                self.model = "my-model"
+                self.port = 8080
+                self.strip_prefix = False
+                self.redirect_https = False
+        
+        class MockData:
+            def __init__(self):
+                self.app = MockAppData()
+                self.units = []  # Add units list
 
+        mock_get_data.return_value = MockData()
 
-def test_reconcile_on_config_changed_invalid():
-    """
-    arrange: State with the container httpbin and invalid config.
-    act: Run config_changed hook.
-    assert: The unit is blocked due to invalid configuration.
-    """
-    context = ops.testing.Context(
-        charm_type=Charm,
-    )
-    container = ops.testing.Container(name="httpbin", can_connect=True)  # type: ignore[call-arg]
-    base_state: dict[str, typing.Any] = {
-        "config": {"log-level": "foobar"},
-        "containers": {container},
-    }
-    state_in = ops.testing.State(**base_state)
-    state_out = context.run(context.on.config_changed(), state_in)
-    assert state_out.unit_status.name == ops.testing.BlockedStatus().name
+        # Setup relations
+        ingress_rel_id = self.harness.add_relation("ingress", "workload")
+        self.harness.add_relation_unit(ingress_rel_id, "workload/0")
+        
+        gateway_rel_id = self.harness.add_relation("gateway-route", "integrator")
+        self.harness.add_relation_unit(gateway_rel_id, "integrator/0")
 
+        # Trigger update
+        self.harness.update_config({"hostname": "valid.example.com", "paths": "/foo,/bar"})
 
-def test_reconcile_container_not_ready():
-    """
-    arrange: State with container that cannot connect.
-    act: Run config_changed hook.
-    assert: The unit is waiting for Pebble API.
-    """
-    context = ops.testing.Context(
-        charm_type=Charm,
-    )
-    container = ops.testing.Container(name="httpbin", can_connect=False)  # type: ignore[call-arg]
-    base_state: dict[str, typing.Any] = {
-        "config": {"log-level": "info"},
-        "containers": {container},
-    }
-    state_in = ops.testing.State(**base_state)
-    state_out = context.run(context.on.config_changed(), state_in)
-    assert state_out.unit_status == ops.testing.WaitingStatus("waiting for Pebble API")
+        # Verify status
+        self.assertIsInstance(self.harness.charm.unit.status, ops.ActiveStatus)
+        self.assertEqual(self.harness.charm.unit.status.message, "Ready")
+
+        # Verify relation data
+        relation_data = self.harness.get_relation_data(gateway_rel_id, self.harness.charm.unit.name)
+        self.assertEqual(relation_data["hostname"], "valid.example.com")
+        self.assertEqual(relation_data["port"], "8080")
+        self.assertEqual(relation_data["application"], "my-app")
+        self.assertEqual(relation_data["model"], "my-model")
+        # Paths are JSON encoded
+        import json
+        self.assertEqual(json.loads(relation_data["paths"]), ["/foo", "/bar"])

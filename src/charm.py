@@ -3,105 +3,105 @@
 # Copyright 2025 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-# Learn more at: https://documentation.ubuntu.com/juju/3.6/howto/manage-charms/#build-a-charm
-
-"""Charm the service.
-
-Refer to the following post for a quick-start guide that will help you
-develop a new k8s charm using the Operator Framework:
-
-https://discourse.charmhub.io/t/4208
-"""
+"""Gateway Route Configurator Charm."""
 
 import logging
 import typing
+import re
 
 import ops
-from ops import pebble
+from charms.gateway_api_integrator.v0.gateway_route import GatewayRouteRequires
+from charms.traefik_k8s.v2.ingress import IngressPerAppProvider, DataValidationError
 
-# Log messages can be retrieved using juju debug-log
 logger = logging.getLogger(__name__)
 
-VALID_LOG_LEVELS = ["info", "debug", "warning", "error", "critical"]
+HOSTNAME_REGEX = re.compile(
+    r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+)
 
 
-class Charm(ops.CharmBase):
-    """Charm implementing holistic reconciliation pattern.
-
-    The holistic pattern centralizes all state reconciliation logic into a single
-    reconcile method that is called from all event handlers. This ensures consistency
-    and reduces code duplication.
-    See https://documentation.ubuntu.com/ops/latest/explanation/holistic-vs-delta-charms/
-    for more information.
-    """
+class GatewayRouteConfiguratorCharm(ops.CharmBase):
+    """Charm the service."""
 
     def __init__(self, *args: typing.Any):
-        """Construct.
-
-        Args:
-            args: Arguments passed to the CharmBase parent constructor.
-        """
         super().__init__(*args)
-        self.framework.observe(self.on.httpbin_pebble_ready, self._on_httpbin_pebble_ready)
-        self.framework.observe(self.on.config_changed, self._on_config_changed)
+        
+        self.ingress = IngressPerAppProvider(self, relation_name="ingress")
+        self.gateway_route = GatewayRouteRequires(self, relation_name="gateway-route")
 
-    def reconcile(self) -> None:
-        """Holistic reconciliation method.
+        self.framework.observe(self.on.config_changed, self._on_update)
+        self.framework.observe(self.ingress.on.data_provided, self._on_update)
+        self.framework.observe(self.ingress.on.data_removed, self._on_update)
+        self.framework.observe(self.on.gateway_route_relation_joined, self._on_update)
+        self.framework.observe(self.on.gateway_route_relation_changed, self._on_update)
 
-        This method contains all the logic needed to reconcile the charm state.
-        It is idempotent and can be called from any event handler.
+    def _on_update(self, _):
+        """Handle updates to config or relations."""
+        self.unit.status = ops.MaintenanceStatus("Configuring gateway route")
 
-        Learn more about interacting with Pebble at
-        https://documentation.ubuntu.com/juju/3.6/reference/pebble/
-        """
-        # Validate configuration
-        log_level = str(self.model.config["log-level"]).lower()
-        if log_level not in VALID_LOG_LEVELS:
-            self.unit.status = ops.BlockedStatus(f"invalid log level: '{log_level}'")
+        # 1. Get Config
+        hostname = self.model.config.get("hostname")
+        paths_str = self.model.config.get("paths", "/")
+        
+        if not hostname:
+            self.unit.status = ops.BlockedStatus("Missing 'hostname' config")
             return
 
-        # Get container
-        container = self.unit.get_container("httpbin")
-        if not container.can_connect():
-            self.unit.status = ops.WaitingStatus("waiting for Pebble API")
+        if not HOSTNAME_REGEX.match(hostname):
+             self.unit.status = ops.BlockedStatus(f"Invalid hostname: {hostname}")
+             return
+
+        paths = [p.strip() for p in paths_str.split(",")]
+
+        # 2. Get Ingress Data
+        ingress_relation = self.model.get_relation("ingress")
+        if not ingress_relation:
+            self.unit.status = ops.BlockedStatus("Missing 'ingress' relation")
+            return
+        
+        try:
+            # We assume single app relation for now
+            if not self.ingress.relations:
+                 self.unit.status = ops.WaitingStatus("Waiting for ingress relation")
+                 return
+            
+            # Use the first relation that has data
+            # IngressPerAppProvider.get_data returns IngressRequirerAppData
+            # But get_data takes a relation object.
+            # We need to iterate over relations and find one with data.
+            
+            # Note: IngressPerAppProvider usually handles multiple relations. 
+            # We should probably aggregate or just pick one. 
+            # The spec implies this charm sits between ONE workload and ONE integrator.
+            
+            data = self.ingress.get_data(self.ingress.relations[0])
+            
+            application_name = data.app.name
+            model_name = data.app.model
+            port = data.app.port
+            
+        except DataValidationError:
+            self.unit.status = ops.BlockedStatus("Invalid ingress data")
+            return
+        except Exception:
+            # If get_data fails (e.g. data not ready), wait.
+            self.unit.status = ops.WaitingStatus("Waiting for ingress data")
             return
 
-        # Configure and ensure workload is running
-        container.add_layer("httpbin", self._pebble_layer, combine=True)
-        container.replan()
-
-        logger.debug("Workload reconciled with log level: %s", log_level)
-        # Learn more about statuses in the SDK docs:
-        # https://documentation.ubuntu.com/juju/latest/reference/status/index.html
-        self.unit.status = ops.ActiveStatus()
-
-    def _on_httpbin_pebble_ready(self, _: ops.PebbleReadyEvent) -> None:
-        """Handle httpbin pebble ready event."""
-        self.reconcile()
-
-    def _on_config_changed(self, _: ops.ConfigChangedEvent) -> None:
-        """Handle changed configuration."""
-        self.reconcile()
-
-    @property
-    def _pebble_layer(self) -> pebble.LayerDict:
-        """Return a dictionary representing a Pebble layer."""
-        return {
-            "summary": "httpbin layer",
-            "description": "pebble config layer for httpbin",
-            "services": {
-                "httpbin": {
-                    "override": "replace",
-                    "summary": "httpbin",
-                    "command": "gunicorn -b 0.0.0.0:80 httpbin:app -k gevent",
-                    "startup": "enabled",
-                    "environment": {
-                        "GUNICORN_CMD_ARGS": f"--log-level {self.model.config['log-level']}"
-                    },
-                }
-            },
-        }
+        # 3. Send to Gateway Route
+        try:
+            self.gateway_route.send_route_configuration(
+                hostname=hostname,
+                paths=paths,
+                port=port,
+                application=application_name,
+                model=model_name
+            )
+            self.unit.status = ops.ActiveStatus("Ready")
+        except Exception as e:
+            logger.exception("Failed to send route configuration")
+            self.unit.status = ops.BlockedStatus(f"Error sending config: {e}")
 
 
 if __name__ == "__main__":  # pragma: nocover
-    ops.main(Charm)
+    ops.main.main(GatewayRouteConfiguratorCharm)
